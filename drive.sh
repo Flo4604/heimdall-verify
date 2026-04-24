@@ -39,14 +39,18 @@ say "egress     = ${EGRESS_MB} MB (single response)"
 say "echo       = ${ECHO_MB} MB (loops of ~1000 KB)"
 
 hdr "reset"
-curl -sSf -XPOST "$URL/reset" -o /dev/null && say "ledger cleared"
+curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 -XPOST "$URL/reset" -o /dev/null && say "ledger cleared"
 
 hdr "info"
-INFO=$(curl -sSf "$URL/info")
+INFO=$(curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 "$URL/info")
 echo "$INFO" | jq .
 POD_UID=$(echo "$INFO" | jq -r '.pod_uid')
 POD_NAME=$(echo "$INFO" | jq -r '.pod_name')
 NODE_NAME=$(echo "$INFO" | jq -r '.node_name')
+# Unkey Deploy intentionally doesn't expose downward API to user pods, so
+# these will be empty. We fall back to DEPLOYMENT_ID env var (set via the
+# Unkey dashboard URL path or API) for CH filtering.
+DEPLOYMENT_ID="${DEPLOYMENT_ID:-}"
 
 # Capture wall time window for the CH query. Both are Unix ms, same format
 # as the app's ts_ms so they can be pasted straight into compare.sql.
@@ -57,7 +61,7 @@ START_TS_MS=$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null
 hdr "drive ingress (${INGRESS_MB} x ~1 MB POSTs)"
 for i in $(seq 1 "$INGRESS_MB"); do
   dd if=/dev/zero bs=1000K count=1 2>/dev/null | \
-    curl -sSf --data-binary @- -H "Content-Type: application/octet-stream" \
+    curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 --data-binary @- -H "Content-Type: application/octet-stream" \
       "$URL/ingress" > /dev/null
   if (( i % 20 == 0 )); then printf "."; fi
 done
@@ -65,13 +69,13 @@ echo ""
 
 hdr "drive egress (single GET, ${EGRESS_MB} MB response)"
 EGRESS_BYTES=$(( EGRESS_MB * 1024 * 1024 ))
-curl -sSf -o /dev/null "${URL}/egress?bytes=${EGRESS_BYTES}"
+curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 -o /dev/null "${URL}/egress?bytes=${EGRESS_BYTES}"
 say "done"
 
 hdr "drive echo (${ECHO_MB} x ~1 MB roundtrips)"
 for i in $(seq 1 "$ECHO_MB"); do
   head -c 1000000 /dev/urandom | \
-    curl -sSf --data-binary @- -o /dev/null "$URL/echo"
+    curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 --data-binary @- -o /dev/null "$URL/echo"
   if (( i % 10 == 0 )); then printf "."; fi
 done
 echo ""
@@ -81,7 +85,7 @@ END_TS_MS=$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null |
             date +%s%3N)
 
 hdr "app-side stats"
-STATS=$(curl -sSf "$URL/stats")
+STATS=$(curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 "$URL/stats")
 echo "$STATS" | jq .
 APP_IN=$(echo "$STATS" | jq -r '.ingress_bytes')
 APP_EG=$(echo "$STATS" | jq -r '.egress_bytes')
@@ -89,10 +93,22 @@ LEDGER_FIRST=$(echo "$STATS" | jq -r '.first_ts_ms')
 LEDGER_LAST=$(echo "$STATS" | jq -r '.last_ts_ms')
 
 hdr "next step"
+# Unkey Deploy doesn't leak pod_uid to user code. We key on resource_id
+# (= unkey.com/deployment.id label). Grab deployment_id from the Unkey
+# dashboard URL for this project and set DEPLOYMENT_ID before re-running,
+# or substitute it manually into the SQL below.
+if [[ -z "$DEPLOYMENT_ID" ]]; then
+  FILTER="-- TODO: set DEPLOYMENT_ID env var or paste the ID below
+  WHERE resource_id = 'dep_REPLACE_ME'"
+else
+  FILTER="WHERE resource_id = '${DEPLOYMENT_ID}'"
+fi
+
 cat <<EOF
-Wait ~30s for heimdall to flush checkpoints, then run this query in ClickHouse:
+Wait ~30s for heimdall to flush checkpoints, then run this in ClickHouse:
 
   SELECT
+    resource_id,
     pod_uid,
     count() AS rows,
     (max(ts) - min(ts)) / 1000.0 AS window_s,
@@ -101,15 +117,14 @@ Wait ~30s for heimdall to flush checkpoints, then run this query in ClickHouse:
     (max(network_egress_public_bytes) + max(network_egress_private_bytes))
       - (min(network_egress_public_bytes) + min(network_egress_private_bytes)) AS ch_egress
   FROM default.instance_checkpoints
-  WHERE pod_uid = '${POD_UID}'
+  ${FILTER}
     AND ts >= ${START_TS_MS}
     AND ts <= ${END_TS_MS}
-  GROUP BY pod_uid;
+  GROUP BY resource_id, pod_uid;
 
 Compare against app-side:
   app_ingress = ${APP_IN} bytes
   app_egress  = ${APP_EG} bytes
 
 Healthy: ch_ingress and ch_egress are 1.00x - 1.30x the app values.
-pod=${POD_NAME} node=${NODE_NAME}
 EOF
