@@ -38,6 +38,16 @@ say "ingress    = ${INGRESS_MB} MB (loops of ~1000 KB due to sentinel 1 MB reque
 say "egress     = ${EGRESS_MB} MB (single response)"
 say "echo       = ${ECHO_MB} MB (loops of ~1000 KB)"
 
+hdr "warmup (Unkey Deploy scale-to-zero cold start can 504 the first ~3 calls)"
+for i in $(seq 1 10); do
+  CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 15 "$URL/healthz" || echo "000")
+  say "attempt $i: $CODE"
+  if [[ "$CODE" == "200" ]]; then
+    break
+  fi
+  sleep 1
+done
+
 hdr "reset"
 curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 -XPOST "$URL/reset" -o /dev/null && say "ledger cleared"
 
