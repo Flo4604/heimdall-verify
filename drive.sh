@@ -15,9 +15,12 @@
 set -euo pipefail
 
 URL="${1:-${URL:-}}"
-INGRESS_MB="${2:-${INGRESS_MB:-200}}"
-EGRESS_MB="${3:-${EGRESS_MB:-500}}"
-ECHO_MB="${4:-${ECHO_MB:-50}}"
+INGRESS_MB="${2:-${INGRESS_MB:-50}}"
+EGRESS_MB="${3:-${EGRESS_MB:-200}}"
+ECHO_MB="${4:-${ECHO_MB:-20}}"
+# Per-request pacing (seconds). HTTP/2 to sentinel can get stream-reset
+# under burst load; a small gap keeps the upstream happy.
+SLEEP_MS="${SLEEP_MS:-1500}"
 
 if [[ -z "$URL" ]]; then
   echo "usage: $0 <URL> [ingress_mb] [egress_mb] [echo_mb]" >&2
@@ -49,10 +52,10 @@ for i in $(seq 1 10); do
 done
 
 hdr "reset"
-curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 -XPOST "$URL/reset" -o /dev/null && say "ledger cleared"
+curl -sSf --http1.1 --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 -XPOST "$URL/reset" -o /dev/null && say "ledger cleared"
 
 hdr "info"
-INFO=$(curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 "$URL/info")
+INFO=$(curl -sSf --http1.1 --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 "$URL/info")
 echo "$INFO" | jq .
 POD_UID=$(echo "$INFO" | jq -r '.pod_uid')
 POD_NAME=$(echo "$INFO" | jq -r '.pod_name')
@@ -68,25 +71,27 @@ START_TS_MS=$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null
               node -e 'console.log(Date.now())' 2>/dev/null || \
               date +%s%3N)
 
-hdr "drive ingress (${INGRESS_MB} x ~1 MB POSTs)"
+hdr "drive ingress (${INGRESS_MB} x ~1 MB POSTs, ${SLEEP_MS}ms gap)"
 for i in $(seq 1 "$INGRESS_MB"); do
   dd if=/dev/zero bs=1000K count=1 2>/dev/null | \
-    curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 --data-binary @- -H "Content-Type: application/octet-stream" \
+    curl -sSf --http1.1 --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 --data-binary @- -H "Content-Type: application/octet-stream" \
       "$URL/ingress" > /dev/null
-  if (( i % 20 == 0 )); then printf "."; fi
+  if (( i % 10 == 0 )); then printf "."; fi
+  sleep "$(awk -v ms="$SLEEP_MS" 'BEGIN {print ms/1000}')"
 done
 echo ""
 
 hdr "drive egress (single GET, ${EGRESS_MB} MB response)"
 EGRESS_BYTES=$(( EGRESS_MB * 1024 * 1024 ))
-curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 -o /dev/null "${URL}/egress?bytes=${EGRESS_BYTES}"
+curl -sSf --http1.1 --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 -o /dev/null "${URL}/egress?bytes=${EGRESS_BYTES}"
 say "done"
 
-hdr "drive echo (${ECHO_MB} x ~1 MB roundtrips)"
+hdr "drive echo (${ECHO_MB} x ~1 MB roundtrips, ${SLEEP_MS}ms gap)"
 for i in $(seq 1 "$ECHO_MB"); do
   head -c 1000000 /dev/urandom | \
-    curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 --data-binary @- -o /dev/null "$URL/echo"
-  if (( i % 10 == 0 )); then printf "."; fi
+    curl -sSf --http1.1 --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 --data-binary @- -o /dev/null "$URL/echo"
+  if (( i % 5 == 0 )); then printf "."; fi
+  sleep "$(awk -v ms="$SLEEP_MS" 'BEGIN {print ms/1000}')"
 done
 echo ""
 
@@ -95,7 +100,7 @@ END_TS_MS=$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null |
             date +%s%3N)
 
 hdr "app-side stats"
-STATS=$(curl -sSf --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 "$URL/stats")
+STATS=$(curl -sSf --http1.1 --retry 5 --retry-all-errors --retry-delay 1 --max-time 60 "$URL/stats")
 echo "$STATS" | jq .
 APP_IN=$(echo "$STATS" | jq -r '.ingress_bytes')
 APP_EG=$(echo "$STATS" | jq -r '.egress_bytes')
